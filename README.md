@@ -8,9 +8,7 @@ cd youtube_downloader
 python -m pip install requirments.txt -U
 fastapi run main.py
 ```
-==================================================
-IP 주소: Xxx.Yyy.Zzz.Aaa
-==================================================
+**IP 주소: Xxx.Yyy.Zzz.Aaa**
 형태의 주소가 뜨면
 
 http://Xxx.Yyy.Zzz.Aaa:8000
