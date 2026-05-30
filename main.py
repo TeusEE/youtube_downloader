@@ -50,7 +50,17 @@ app.mount("/files", StaticFiles(directory=SHARED_FOLDER), name="files")
 
 
 import socket
-# 호스트 이름을 기준으로 IP 주소 가져오기
-hostname = socket.gethostname()
-ip_address = socket.gethostbyname(hostname)
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+ip_address = get_local_ip()
 print("="*50, f"\nIP 주소: {ip_address}\n", "="*50)
