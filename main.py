@@ -6,7 +6,7 @@ import os
 app = FastAPI()
 
 # 파일이 저장된 폴더 경로
-SHARED_FOLDER = r".\video"
+SHARED_FOLDER = r"./video"
 
 # 디렉토리 존재 여부 확인
 if not os.path.exists(SHARED_FOLDER):
