@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 import asyncio
+import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
+import uuid
 
 app = FastAPI()
 
@@ -18,9 +20,12 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
+# 진행 중인 작업 저장소: job_id -> {queue, tmpdir, file_path, filename}
+jobs: dict = {}
 
-async def _drain(stream, prefix: str, lines: list):
-    """서브프로세스 출력 스트림을 줄 단위로 읽어 즉시 로그에 남긴다."""
+
+async def _drain(stream, prefix: str, lines: list, name: str, on_line):
+    """서브프로세스 출력 스트림을 줄 단위로 읽어 즉시 로그에 남기고 콜백에 전달한다."""
     while True:
         raw = await stream.readline()
         if not raw:
@@ -29,9 +34,14 @@ async def _drain(stream, prefix: str, lines: list):
         if text:
             lines.append(text)
             logger.info("%s%s", prefix, text)
+            if on_line:
+                try:
+                    on_line(name, text)
+                except Exception:
+                    pass
 
 
-async def run_ytdlp(args: list, label: str):
+async def run_ytdlp(args: list, label: str, on_line=None):
     """yt-dlp를 실행하며 stdout/stderr를 실시간 스트리밍한다. (returncode, stdout줄, stderr줄) 반환."""
     logger.info("▶ 시작: %s", label)
     proc = await asyncio.create_subprocess_exec(
@@ -42,8 +52,8 @@ async def run_ytdlp(args: list, label: str):
     stdout_lines: list = []
     stderr_lines: list = []
     await asyncio.gather(
-        _drain(proc.stdout, "", stdout_lines),
-        _drain(proc.stderr, "! ", stderr_lines),
+        _drain(proc.stdout, "", stdout_lines, "stdout", on_line),
+        _drain(proc.stderr, "! ", stderr_lines, "stderr", on_line),
     )
     rc = await proc.wait()
     logger.info("■ 종료 (코드 %s): %s", rc, label)
@@ -193,67 +203,174 @@ BASE_STYLE = """
         text-decoration: none;
         color: var(--accent);
         font-size: 15px;
-        margin-top: 22px;
+        margin-top: 18px;
     }
+    /* 진행률 UI */
+    .bar-track {
+        width: 100%;
+        height: 10px;
+        background: var(--field);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        overflow: hidden;
+        margin: 18px 0;
+    }
+    .bar-fill {
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        border-radius: 999px;
+        transition: width 0.2s ease;
+    }
+    .status { font-size: 17px; font-weight: 600; text-align: center; margin: 0 0 4px; }
+    .detail {
+        font-size: 14px;
+        color: var(--muted);
+        text-align: center;
+        margin: 0 0 8px;
+        min-height: 18px;
+        font-variant-numeric: tabular-nums;
+    }
+    #result { display: flex; flex-direction: column; }
+"""
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="ko">
+    <head>
+        <meta charset="utf-8">
+        <title>YouTube 다운로더</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <style>__STYLE__</style>
+    </head>
+    <body>
+        <div class="card" id="form-card">
+            <h1>YouTube 다운로더</h1>
+            <p class="subtitle">영상을 디바이스에 저장해 오프라인으로 시청하세요.</p>
+            <form id="dl-form">
+                <label class="field-label" for="vd_dir">유튜브 주소</label>
+                <input type="text" id="vd_dir" name="vd_dir"
+                    placeholder="https://www.youtube.com/watch?v=..."
+                    autocomplete="off" autocapitalize="off" spellcheck="false">
+                <div class="options">
+                    <label class="option">
+                        <input type="radio" name="quality" value="fast" checked>
+                        <span>
+                            <span class="opt-title">빠름 · 최대 720p</span>
+                            <span class="opt-desc">서버를 거치지 않음 · 저장 시 한 단계 더 필요</span>
+                        </span>
+                    </label>
+                    <label class="option">
+                        <input type="radio" name="quality" value="hq">
+                        <span>
+                            <span class="opt-title">고화질 · 1080p 이상</span>
+                            <span class="opt-desc">서버에서 병합 후 바로 저장</span>
+                        </span>
+                    </label>
+                </div>
+                <button type="submit">다운로드</button>
+            </form>
+        </div>
+
+        <div class="card" id="prog-card" style="display:none">
+            <h1>다운로드</h1>
+            <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
+            <p class="status" id="status">작업 시작 중...</p>
+            <p class="detail" id="detail"></p>
+            <div id="result"></div>
+        </div>
+
+        <script>
+        const form = document.getElementById('dl-form');
+        const formCard = document.getElementById('form-card');
+        const progCard = document.getElementById('prog-card');
+        const bar = document.getElementById('bar');
+        const statusEl = document.getElementById('status');
+        const detailEl = document.getElementById('detail');
+        const resultEl = document.getElementById('result');
+        let es = null;
+
+        function setBar(pct) {
+            bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fd = new FormData(form);
+            formCard.style.display = 'none';
+            progCard.style.display = 'block';
+            resultEl.innerHTML = '';
+            setBar(0);
+            statusEl.textContent = '작업 시작 중...';
+            detailEl.textContent = '';
+            try {
+                const res = await fetch('/start', { method: 'POST', body: fd });
+                if (!res.ok) throw new Error('작업을 시작하지 못했습니다.');
+                const data = await res.json();
+                es = new EventSource('/progress/' + data.job_id);
+                es.onmessage = (ev) => handleEvent(JSON.parse(ev.data));
+            } catch (err) {
+                showError(err.message || '오류가 발생했습니다.');
+            }
+        });
+
+        function handleEvent(d) {
+            if (d.type === 'progress') {
+                const pct = parseFloat(d.percent) || 0;
+                setBar(pct);
+                statusEl.textContent = '다운로드 중 ' + (d.percent || '').trim();
+                detailEl.textContent = [d.speed, d.eta ? 'ETA ' + d.eta : '']
+                    .filter(Boolean).join('  ·  ');
+            } else if (d.type === 'status') {
+                statusEl.textContent = d.message;
+            } else if (d.type === 'done') {
+                setBar(100);
+                if (es) es.close();
+                if (d.mode === 'file') {
+                    statusEl.textContent = '완료! 다운로드를 시작합니다.';
+                    detailEl.textContent = '';
+                    window.location = d.url;
+                    resultEl.innerHTML =
+                        '<a class="link-btn" href="' + d.url + '">다운로드가 안 되면 여기를 누르세요</a>';
+                } else {
+                    statusEl.textContent = '준비 완료';
+                    detailEl.textContent = '아래 버튼을 길게 눌러 "파일에 저장"하세요.';
+                    resultEl.innerHTML =
+                        '<a class="link-btn" href="' + d.url + '" download>▶ 영상 다운로드</a>';
+                }
+                resultEl.innerHTML += '<a class="back" href="/">← 다시 다운로드</a>';
+            } else if (d.type === 'error') {
+                showError(d.message);
+            }
+        }
+
+        function showError(msg) {
+            if (es) es.close();
+            setBar(0);
+            statusEl.textContent = '오류가 발생했습니다';
+            detailEl.textContent = msg;
+            resultEl.innerHTML = '<a class="back" href="/">← 다시 시도</a>';
+        }
+        </script>
+    </body>
+</html>
 """
 
 
 @app.get("/", response_class=HTMLResponse)
 async def main():
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="ko">
-        <head>
-            <meta charset="utf-8">
-            <title>YouTube 다운로더</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-            <style>{BASE_STYLE}</style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>YouTube 다운로더</h1>
-                <p class="subtitle">영상을 디바이스에 저장해 오프라인으로 시청하세요.</p>
-                <form action="/filedown" method="post">
-                    <label class="field-label" for="vd_dir">유튜브 주소</label>
-                    <input type="text" id="vd_dir" name="vd_dir"
-                        placeholder="https://www.youtube.com/watch?v=..."
-                        autocomplete="off" autocapitalize="off" spellcheck="false">
-                    <div class="options">
-                        <label class="option">
-                            <input type="radio" name="quality" value="fast" checked>
-                            <span>
-                                <span class="opt-title">빠름 · 최대 720p</span>
-                                <span class="opt-desc">서버를 거치지 않음 · 저장 시 한 단계 더 필요</span>
-                            </span>
-                        </label>
-                        <label class="option">
-                            <input type="radio" name="quality" value="hq">
-                            <span>
-                                <span class="opt-title">고화질 · 1080p 이상</span>
-                                <span class="opt-desc">서버에서 병합 후 바로 저장</span>
-                            </span>
-                        </label>
-                    </div>
-                    <button type="submit">다운로드</button>
-                </form>
-            </div>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
+    return HTMLResponse(content=INDEX_HTML.replace("__STYLE__", BASE_STYLE), status_code=200)
 
 
 # 경로 A — 직접 URL 추출 (서버가 데이터를 거치지 않음, ≤720p progressive)
-async def get_direct_url(vd_dir: str) -> str:
+async def get_direct_url(vd_dir: str, on_line=None) -> str:
     rc, stdout_lines, stderr_lines = await run_ytdlp(
         ["-f", "b[ext=mp4][acodec!=none][vcodec!=none]/b[ext=mp4]", "-g", vd_dir],
         label=f"URL 추출 {vd_dir}",
+        on_line=on_line,
     )
     if rc != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"URL 추출 실패: {' '.join(stderr_lines)[:500]}",
-        )
+        raise HTTPException(status_code=400, detail=f"URL 추출 실패: {' '.join(stderr_lines)[:500]}")
     url = next((line for line in stdout_lines if line.startswith("http")), "")
     if not url:
         raise HTTPException(status_code=404, detail="다운로드 가능한 단일 포맷을 찾지 못했습니다.")
@@ -261,7 +378,7 @@ async def get_direct_url(vd_dir: str) -> str:
 
 
 # 경로 B — 서버에서 병합 후 파일 전송 (1080p+, 요청별 격리 디렉토리)
-async def merge_and_path(vd_dir: str, tmpdir: str) -> str:
+async def merge_and_path(vd_dir: str, tmpdir: str, on_line=None) -> str:
     rc, stdout_lines, stderr_lines = await run_ytdlp(
         [
             "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/best[vcodec^=avc1][ext=mp4]",
@@ -270,16 +387,17 @@ async def merge_and_path(vd_dir: str, tmpdir: str) -> str:
             "--print", "after_move:filepath",
             "--no-simulate",
             "--progress",  # --print이 활성화하는 quiet 모드에서도 진행률 강제 출력
-            "--newline",   # 진행률을 \r 대신 줄바꿈으로 출력 → 실시간 로그 가능
+            "--newline",   # 진행률을 \r 대신 줄바꿈으로 출력 → 줄 단위 스트리밍
+            # 진행률을 파싱하기 쉬운 형식으로 출력 (퍼센트@@속도@@ETA)
+            "--progress-template",
+            "download:@@PROG@@%(progress._percent_str)s@@%(progress._speed_str)s@@%(progress._eta_str)s",
             vd_dir,
         ],
         label=f"병합 다운로드 {vd_dir}",
+        on_line=on_line,
     )
     if rc != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"다운로드/병합 실패: {' '.join(stderr_lines)[:500]}",
-        )
+        raise HTTPException(status_code=400, detail=f"다운로드/병합 실패: {' '.join(stderr_lines)[:500]}")
     # 진행률 줄이 섞여 있으므로, 실제 존재하는 파일 경로 줄을 역순으로 탐색
     file_path = next((line for line in reversed(stdout_lines) if os.path.isfile(line)), "")
     if not file_path:
@@ -287,46 +405,110 @@ async def merge_and_path(vd_dir: str, tmpdir: str) -> str:
     return file_path
 
 
-# 파일 다운로드용 엔드포인트
-@app.post("/filedown")
-async def down_yt(
-    vd_dir: str = Form(...),
-    quality: str = Form("fast"),
-    background_tasks: BackgroundTasks = None,
-):
-    # 경로 A: 직접 URL — 서버는 URL만 추출, 클라이언트가 CDN에서 직접 다운로드
-    if quality == "fast":
-        url = await get_direct_url(vd_dir)
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="ko">
-            <head>
-                <meta charset="utf-8">
-                <title>다운로드 링크</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-                <style>{BASE_STYLE}</style>
-            </head>
-            <body>
-                <div class="card">
-                    <h1>준비 완료</h1>
-                    <p class="hint">아래 버튼을 <b>길게 눌러 → "파일에 저장"</b>으로<br>오프라인 저장하세요.</p>
-                    <a class="link-btn" href="{url}" download>▶ 영상 다운로드</a>
-                    <a class="back" href="/">← 다시 다운로드</a>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(content=html_content, status_code=200)
+def _make_line_handler(queue: asyncio.Queue):
+    """yt-dlp 출력 줄을 SSE 이벤트로 변환해 큐에 넣는 콜백을 만든다."""
+    def handler(_name: str, text: str):
+        if text.startswith("@@PROG@@"):
+            parts = text[len("@@PROG@@"):].split("@@")
+            queue.put_nowait({
+                "type": "progress",
+                "percent": parts[0].strip() if len(parts) > 0 else "",
+                "speed": parts[1].strip() if len(parts) > 1 else "",
+                "eta": parts[2].strip() if len(parts) > 2 else "",
+            })
+        elif "Merging formats" in text or "[Merger]" in text:
+            queue.put_nowait({"type": "status", "message": "병합 중..."})
+    return handler
 
-    # 경로 B: 고화질 — 서버에서 병합 후 파일 전송
-    tmpdir = tempfile.mkdtemp(prefix="ytdl_")
-    background_tasks.add_task(shutil.rmtree, tmpdir, ignore_errors=True)
-    file_path = await merge_and_path(vd_dir, tmpdir)
+
+async def _run_job(job_id: str, vd_dir: str, quality: str):
+    job = jobs[job_id]
+    queue: asyncio.Queue = job["queue"]
+    handler = _make_line_handler(queue)
+    try:
+        if quality == "fast":
+            queue.put_nowait({"type": "status", "message": "링크 추출 중..."})
+            url = await get_direct_url(vd_dir, on_line=handler)
+            queue.put_nowait({"type": "done", "mode": "link", "url": url})
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="ytdl_")
+            job["tmpdir"] = tmpdir
+            queue.put_nowait({"type": "status", "message": "다운로드 준비 중..."})
+            file_path = await merge_and_path(vd_dir, tmpdir, on_line=handler)
+            job["file_path"] = file_path
+            job["filename"] = os.path.basename(file_path)
+            queue.put_nowait({"type": "done", "mode": "file", "url": f"/result/{job_id}"})
+    except HTTPException as e:
+        queue.put_nowait({"type": "error", "message": str(e.detail)})
+    except Exception as e:
+        queue.put_nowait({"type": "error", "message": f"{e}"})
+    finally:
+        queue.put_nowait({"type": "_end"})
+        # 안전망: 일정 시간 후 작업/임시폴더 정리 (file 모드는 /result에서 우선 정리됨)
+        asyncio.create_task(_expire_job(job_id, 600))
+
+
+async def _expire_job(job_id: str, delay: int):
+    await asyncio.sleep(delay)
+    job = jobs.pop(job_id, None)
+    if job and job.get("tmpdir"):
+        shutil.rmtree(job["tmpdir"], ignore_errors=True)
+
+
+# 작업 시작 — job_id 즉시 반환, 다운로드는 백그라운드로 진행
+@app.post("/start")
+async def start(vd_dir: str = Form(...), quality: str = Form("fast")):
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"queue": asyncio.Queue(), "tmpdir": None, "file_path": None, "filename": None}
+    asyncio.create_task(_run_job(job_id, vd_dir, quality))
+    return {"job_id": job_id}
+
+
+# 진행 상황 SSE 스트림
+@app.get("/progress/{job_id}")
+async def progress(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+
+    async def event_stream():
+        queue: asyncio.Queue = job["queue"]
+        while True:
+            event = await queue.get()
+            if event.get("type") == "_end":
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+# 완성된 파일 다운로드 (경로 B 고화질)
+@app.get("/result/{job_id}")
+async def result(job_id: str, background_tasks: BackgroundTasks):
+    job = jobs.get(job_id)
+    if not job or not job.get("file_path") or not os.path.isfile(job["file_path"]):
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    file_path = job["file_path"]
+    filename = job["filename"]
+    tmpdir = job.get("tmpdir")
+
+    def cleanup():
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        jobs.pop(job_id, None)
+
+    background_tasks.add_task(cleanup)
     return FileResponse(
         file_path,
-        filename=os.path.basename(file_path),
+        filename=filename,
         media_type="video/mp4",
         content_disposition_type="attachment",
+        background=background_tasks,
     )
 
 

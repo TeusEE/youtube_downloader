@@ -73,6 +73,23 @@ HH:MM:SS [yt-dlp] [download]   3.3% of  245.69MiB at   10.93MiB/s ETA 00:21
 HH:MM:SS [yt-dlp] ■ 종료 (코드 0): ...
 ```
 
+## 클라이언트 진행률 (SSE)
+
+서버 로그에만 진행 상황이 남고 사용자 화면에서는 알 수 없던 문제를 해결. **SSE(Server-Sent Events)** 채택 — 진행률은 서버→클라이언트 단방향이라 WebSocket보다 단순하고 추가 의존성이 없으며 iOS Safari `EventSource`로 잘 동작.
+
+기존 "폼 POST 한 방에 다운로드+전송" 구조로는 진행률을 끼울 수 없어 **작업을 3단계로 분리**:
+
+1. **`POST /start`** — `vd_dir`/`quality`를 받아 `job_id` 즉시 반환, 다운로드는 `asyncio.create_task`로 백그라운드 실행. `jobs` 딕셔너리에 작업별 `asyncio.Queue` 보관.
+2. **`GET /progress/{job_id}`** (SSE, `StreamingResponse` + `text/event-stream`) — 큐의 이벤트를 `data: {...}` 로 push. 이벤트 종류: `status` / `progress`(percent·speed·eta) / `done`(mode link|file) / `error`.
+3. **`GET /result/{job_id}`** — 경로 B 완성 파일을 `FileResponse(attachment)`로 전송 후 `background_tasks`로 임시폴더+작업 정리.
+
+구현 포인트:
+- **진행률 파싱**: `--progress-template "download:@@PROG@@%(progress._percent_str)s@@..."` 로 기계가 읽기 쉬운 형식 출력 → `_make_line_handler`가 파싱해 큐에 push. `run_ytdlp`/`_drain`에 `on_line` 콜백 추가.
+- **작업 수명 관리**: `/result` 수신 시 즉시 정리, 미수신 대비 `_expire_job`이 600초 후 임시폴더+작업 정리(누수 방지).
+- **프론트엔드**: 폼을 JS 구동으로 변경(`fetch('/start')` → `EventSource`), 진행률 바 + 상태/속도/ETA 표시. 완료 시 `file` 모드는 `/result`로 자동 다운로드, `link` 모드는 "길게 눌러 저장" 링크 표시. 기존 별도 결과 페이지 제거(단일 페이지에서 전환).
+
+검증(실제 영상): 빠름 모드 `status→done(link)`, 고화질 모드 `status→progress(0%→…, speed/ETA 실시간)→done(file)` SSE 스트림 정상 수신 확인.
+
 ## 함께 해결된 기존 버그
 - **명령 주입 취약점**: URL이 `os.system` 셸 문자열에 직접 삽입되던 문제.
 - **동시 요청 경쟁 조건**: `os.listdir[0]`이 다른 요청의 파일을 집을 수 있던 문제.
