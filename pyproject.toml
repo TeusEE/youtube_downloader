@@ -1,0 +1,13 @@
+[project]
+name = "youtube-downloader"
+version = "0.1.0"
+description = "yt-dlp 기반 FastAPI 유튜브 동영상 다운로더"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]",
+    "yt-dlp",
+]
+
+[dependency-groups]
+dev = []
