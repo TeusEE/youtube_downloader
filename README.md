@@ -35,3 +35,16 @@ uv lock --upgrade            # 잠금 파일 최신 버전으로 갱신
 ```
 
 `uv run`을 사용하면 `source .venv/bin/activate` 없이 바로 실행됩니다.
+
+## 실행 도구 확인
+
+YouTube의 최신 추출 과정에는 JavaScript 런타임이 필요합니다. 이 앱은 설치된 Node.js를
+`--js-runtimes node`로 자동 활성화합니다. 고화질 다운로드와 MP4 변환에는 `ffmpeg`도 필요합니다.
+
+```bash
+node --version
+ffmpeg -version
+uv run yt-dlp --js-runtimes node --version
+```
+
+빠름/고화질 모드 모두 서버에서 MP4 파일을 완성한 뒤 아이폰에 첨부 파일로 전송합니다.

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 import asyncio
 import json
@@ -8,9 +8,6 @@ import shutil
 import sys
 import tempfile
 import uuid
-from urllib.parse import quote
-
-import httpx
 
 app = FastAPI()
 
@@ -23,8 +20,12 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-# 진행 중인 작업 저장소: job_id -> {queue, tmpdir, file_path, filename, direct_url}
+# 진행 중인 작업 저장소: job_id -> {queue, tmpdir, file_path, filename}
 jobs: dict = {}
+
+# yt-dlp의 YouTube EJS 처리를 위해 Node.js 런타임을 명시적으로 활성화한다.
+# --version은 런타임 확인용 명령에서만 사용하며, 다운로드 인자에는 넣지 않는다.
+YTDLP_RUNTIME_ARGS = ["--js-runtimes", "node"]
 
 
 def _safe_filename(title: str) -> str:
@@ -35,12 +36,6 @@ def _safe_filename(title: str) -> str:
     if not name.lower().endswith(".mp4"):
         name += ".mp4"
     return name
-
-
-def _content_disposition(filename: str) -> str:
-    """iOS/모든 브라우저 호환 첨부 헤더 (ASCII 폴백 + RFC 5987 UTF-8)."""
-    ascii_name = filename.encode("ascii", "ignore").decode() or "video.mp4"
-    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
 
 async def _drain(stream, prefix: str, lines: list, name: str, on_line):
@@ -64,7 +59,7 @@ async def run_ytdlp(args: list, label: str, on_line=None):
     """yt-dlp를 실행하며 stdout/stderr를 실시간 스트리밍한다. (returncode, stdout줄, stderr줄) 반환."""
     logger.info("▶ 시작: %s", label)
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", *args,
+        "yt-dlp", *YTDLP_RUNTIME_ARGS, *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -308,9 +303,18 @@ INDEX_HTML = """
         const detailEl = document.getElementById('detail');
         const resultEl = document.getElementById('result');
         let es = null;
+        let maxProgress = 0;
 
         function setBar(pct) {
-            bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+            const bounded = Math.max(0, Math.min(100, pct));
+            // HLS manifest/분리 스트림이 먼저 100%를 보고한 뒤 실제 미디어
+            // 다운로드가 0%부터 시작할 수 있으므로 새 단계로 인식한다.
+            if (bounded < maxProgress) {
+                if (maxProgress >= 95 && bounded <= 20) maxProgress = 0;
+                else return;
+            }
+            maxProgress = bounded;
+            bar.style.width = bounded + '%';
         }
 
         form.addEventListener('submit', async (e) => {
@@ -319,6 +323,7 @@ INDEX_HTML = """
             formCard.style.display = 'none';
             progCard.style.display = 'block';
             resultEl.innerHTML = '';
+            maxProgress = 0;
             setBar(0);
             statusEl.textContent = '작업 시작 중...';
             detailEl.textContent = '';
@@ -348,10 +353,8 @@ INDEX_HTML = """
                 statusEl.textContent = '완료!';
                 detailEl.textContent = '아이폰은 버튼을 누른 뒤 "다운로드"를 선택하면 파일 앱에 저장됩니다.';
                 resultEl.innerHTML =
-                    '<a class="link-btn" href="' + d.url + '">▶ 영상 저장</a>' +
+                    '<a class="link-btn" href="' + d.url + '" download>▶ 영상 저장</a>' +
                     '<a class="back" href="/">← 다시 다운로드</a>';
-                // 데스크톱 등에서는 자동으로 다운로드 시작
-                window.location = d.url;
             } else if (d.type === 'error') {
                 showError(d.message);
             }
@@ -375,32 +378,31 @@ async def main():
     return HTMLResponse(content=INDEX_HTML.replace("__STYLE__", BASE_STYLE), status_code=200)
 
 
-# 경로 A — 직접 URL + 제목 추출 (≤720p progressive). 서버가 /stream으로 프록시한다.
-async def get_direct_url(vd_dir: str, on_line=None) -> tuple[str, str]:
-    rc, stdout_lines, stderr_lines = await run_ytdlp(
-        [
-            "-f", "b[ext=mp4][acodec!=none][vcodec!=none]/b[ext=mp4]",
-            "--print", "%(title)s",  # 첫 줄: 제목
-            "--print", "urls",        # 다음 줄: 직접 다운로드 URL
-            vd_dir,
-        ],
-        label=f"URL 추출 {vd_dir}",
-        on_line=on_line,
-    )
-    if rc != 0:
-        raise HTTPException(status_code=400, detail=f"URL 추출 실패: {' '.join(stderr_lines)[:500]}")
-    url = next((line for line in stdout_lines if line.startswith("http")), "")
-    if not url:
-        raise HTTPException(status_code=404, detail="다운로드 가능한 단일 포맷을 찾지 못했습니다.")
-    title = next((line for line in stdout_lines if line and not line.startswith("http")), "")
-    return url, title
+# 모든 화질은 서버에서 파일로 완성한 뒤 같은 출처의 /result로 전송한다.
+# 빠름 모드는 720p 이하를 우선 선택하고, 고화질 모드는 가능한 최고 화질을 선택한다.
+FAST_FORMAT = (
+    "best[height<=720][ext=mp4][acodec!=none][vcodec!=none]/"
+    "bv*[height<=720][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
+    "best[height<=720][vcodec^=avc1][ext=mp4]"
+)
+# YouTube의 일부 DASH URL은 현재 환경에서 PO token/클라이언트 조건 때문에 403이
+# 발생할 수 있다. 오디오가 포함된 HLS MP4를 먼저 선택하면 yt-dlp가 서버에서
+# 세그먼트를 받아 완성 파일로 만들 수 있고, HLS가 없는 영상만 DASH로 fallback한다.
+HQ_FORMAT = (
+    "best[ext=mp4][protocol^=m3u8]/"
+    "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/"
+    "best[vcodec^=avc1][ext=mp4]/best[ext=mp4]"
+)
 
 
-# 경로 B — 서버에서 병합 후 파일 전송 (1080p+, 요청별 격리 디렉토리)
-async def merge_and_path(vd_dir: str, tmpdir: str, on_line=None) -> str:
+async def download_video(vd_dir: str, tmpdir: str, quality: str, on_line=None) -> str:
+    """영상을 요청별 임시 디렉토리에 저장하고 완성된 파일 경로를 반환한다."""
+    format_selector = FAST_FORMAT if quality == "fast" else HQ_FORMAT
+    label = "빠른 다운로드" if quality == "fast" else "고화질 다운로드/병합"
     rc, stdout_lines, stderr_lines = await run_ytdlp(
         [
-            "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/best[vcodec^=avc1][ext=mp4]",
+            "--no-playlist",
+            "-f", format_selector,
             "--merge-output-format", "mp4",
             "-o", os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "--print", "after_move:filepath",
@@ -412,15 +414,27 @@ async def merge_and_path(vd_dir: str, tmpdir: str, on_line=None) -> str:
             "download:@@PROG@@%(progress._percent_str)s@@%(progress._speed_str)s@@%(progress._eta_str)s",
             vd_dir,
         ],
-        label=f"병합 다운로드 {vd_dir}",
+        label=f"{label} {vd_dir}",
         on_line=on_line,
     )
     if rc != 0:
-        raise HTTPException(status_code=400, detail=f"다운로드/병합 실패: {' '.join(stderr_lines)[:500]}")
+        detail = " ".join(stderr_lines).strip()[:500] or "yt-dlp가 실패 원인을 반환하지 않았습니다."
+        raise HTTPException(status_code=400, detail=f"다운로드/병합 실패: {detail}")
     # 진행률 줄이 섞여 있으므로, 실제 존재하는 파일 경로 줄을 역순으로 탐색
-    file_path = next((line for line in reversed(stdout_lines) if os.path.isfile(line)), "")
+    file_path = next(
+        (line.strip() for line in reversed(stdout_lines) if os.path.isfile(line.strip())),
+        "",
+    )
     if not file_path:
-        raise HTTPException(status_code=404, detail="병합된 파일을 찾지 못했습니다.")
+        # 출력 형식이 바뀌어 filepath가 로그에 섞여도 임시 디렉토리에서 복구한다.
+        candidates = [
+            os.path.join(tmpdir, name)
+            for name in os.listdir(tmpdir)
+            if os.path.isfile(os.path.join(tmpdir, name)) and not name.endswith(".part")
+        ]
+        file_path = max(candidates, key=os.path.getmtime, default="")
+    if not file_path:
+        raise HTTPException(status_code=404, detail="다운로드된 파일을 찾지 못했습니다.")
     return file_path
 
 
@@ -444,25 +458,23 @@ async def _run_job(job_id: str, vd_dir: str, quality: str):
     job = jobs[job_id]
     queue: asyncio.Queue = job["queue"]
     handler = _make_line_handler(queue)
+    tmpdir = tempfile.mkdtemp(prefix="ytdl_")
+    job["tmpdir"] = tmpdir
     try:
-        if quality == "fast":
-            queue.put_nowait({"type": "status", "message": "링크 추출 중..."})
-            url, title = await get_direct_url(vd_dir, on_line=handler)
-            job["direct_url"] = url
-            job["filename"] = _safe_filename(title)
-            # 직링크 대신 같은 출처 프록시 URL을 내려줘야 iOS가 첨부로 인식해 저장한다
-            queue.put_nowait({"type": "done", "mode": "file", "url": f"/stream/{job_id}"})
-        else:
-            tmpdir = tempfile.mkdtemp(prefix="ytdl_")
-            job["tmpdir"] = tmpdir
-            queue.put_nowait({"type": "status", "message": "다운로드 준비 중..."})
-            file_path = await merge_and_path(vd_dir, tmpdir, on_line=handler)
-            job["file_path"] = file_path
-            job["filename"] = os.path.basename(file_path)
-            queue.put_nowait({"type": "done", "mode": "file", "url": f"/result/{job_id}"})
+        message = "빠른 다운로드 준비 중..." if quality == "fast" else "고화질 다운로드 준비 중..."
+        queue.put_nowait({"type": "status", "message": message})
+        file_path = await download_video(vd_dir, tmpdir, quality, on_line=handler)
+        job["file_path"] = file_path
+        title = os.path.splitext(os.path.basename(file_path))[0]
+        job["filename"] = _safe_filename(title)
+        queue.put_nowait({"type": "done", "mode": "file", "url": f"/result/{job_id}"})
     except HTTPException as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        job["tmpdir"] = None
         queue.put_nowait({"type": "error", "message": str(e.detail)})
     except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        job["tmpdir"] = None
         queue.put_nowait({"type": "error", "message": f"{e}"})
     finally:
         queue.put_nowait({"type": "_end"})
@@ -480,9 +492,14 @@ async def _expire_job(job_id: str, delay: int):
 # 작업 시작 — job_id 즉시 반환, 다운로드는 백그라운드로 진행
 @app.post("/start")
 async def start(vd_dir: str = Form(...), quality: str = Form("fast")):
+    vd_dir = vd_dir.strip()
+    if not vd_dir:
+        raise HTTPException(status_code=400, detail="유튜브 주소를 입력해 주세요.")
+    if quality not in {"fast", "hq"}:
+        raise HTTPException(status_code=400, detail="지원하지 않는 화질 옵션입니다.")
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"queue": asyncio.Queue(), "tmpdir": None, "file_path": None,
-                    "filename": None, "direct_url": None}
+                    "filename": None}
     asyncio.create_task(_run_job(job_id, vd_dir, quality))
     return {"job_id": job_id}
 
@@ -509,7 +526,7 @@ async def progress(job_id: str):
     )
 
 
-# 완성된 파일 다운로드 (경로 B 고화질)
+# 완성된 파일 다운로드 (빠름/고화질 공통)
 @app.get("/result/{job_id}")
 async def result(job_id: str, background_tasks: BackgroundTasks):
     job = jobs.get(job_id)
@@ -532,52 +549,6 @@ async def result(job_id: str, background_tasks: BackgroundTasks):
         media_type="video/mp4",
         content_disposition_type="attachment",
         background=background_tasks,
-    )
-
-
-# 빠름 모드 다운로드 — 직링크를 같은 출처로 프록시하며 첨부 헤더를 붙인다.
-# iOS Safari는 same-origin + Content-Disposition: attachment 일 때만 "파일에 저장"이 동작한다.
-@app.get("/stream/{job_id}")
-async def stream(job_id: str, request: Request):
-    job = jobs.get(job_id)
-    if not job or not job.get("direct_url"):
-        raise HTTPException(status_code=404, detail="스트림을 찾을 수 없습니다.")
-
-    src = job["direct_url"]
-    filename = job.get("filename") or "video.mp4"
-
-    # 클라이언트(특히 iOS 다운로드 매니저)의 Range 요청을 그대로 상위로 전달
-    fwd = {"User-Agent": "Mozilla/5.0"}
-    if "range" in request.headers:
-        fwd["Range"] = request.headers["range"]
-
-    client = httpx.AsyncClient(timeout=httpx.Timeout(None), follow_redirects=True)
-    upstream = await client.send(
-        client.build_request("GET", src, headers=fwd), stream=True
-    )
-
-    headers = {
-        "Content-Disposition": _content_disposition(filename),
-        "Accept-Ranges": "bytes",
-    }
-    for h in ("content-length", "content-range"):
-        if h in upstream.headers:
-            headers[h] = upstream.headers[h]
-    media_type = upstream.headers.get("content-type", "video/mp4")
-
-    async def body():
-        try:
-            async for chunk in upstream.aiter_bytes():
-                yield chunk
-        finally:
-            await upstream.aclose()
-            await client.aclose()
-
-    return StreamingResponse(
-        body(),
-        status_code=upstream.status_code,
-        headers=headers,
-        media_type=media_type,
     )
 
 
