@@ -24,8 +24,12 @@ if not logger.handlers:
 jobs: dict = {}
 
 # yt-dlp의 YouTube EJS 처리를 위해 Node.js 런타임을 명시적으로 활성화한다.
-# --version은 런타임 확인용 명령에서만 사용하며, 다운로드 인자에는 넣지 않는다.
-YTDLP_RUNTIME_ARGS = ["--js-runtimes", "node"]
+# web_embedded 클라이언트는 일부 영상에서 android_vr보다 안정적으로
+# GVS 미디어 URL을 제공하며, 현재 YouTube의 PO Token 정책으로 인한 403을 줄인다.
+YTDLP_RUNTIME_ARGS = [
+    "--js-runtimes", "node",
+    "--extractor-args", "youtube:player_client=web_embedded",
+]
 
 
 def _safe_filename(title: str) -> str:
